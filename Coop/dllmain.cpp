@@ -2,6 +2,7 @@
 // Этап 3: сетевой слой (lockstep) + одинаковый генератор случайных чисел у обоих игроков
 // Оформление: правая половина панели (слоты 4–6, растения игрока 2) — сиреневая
 // Этап 4: игра не зависает при ожидании напарника; уход напарника с уровня и обрыв связи
+// Сложность: бюджет волн зомби (wave_budget), задаёт хост
 //
 // Как играть по сети: оба подключаются (в главном меню), затем оба запускают ОДИН И ТОТ ЖЕ уровень
 // и выбирают одинаковые растения. Синхронная игра стартует сама на первом игровом тике.
@@ -202,6 +203,7 @@ struct Config {
     char    host[128] = "127.0.0.1";
     int     port = 34567;
     int     delay = 10;   // задержка ввода в тиках (10 тиков = 100 мс)
+    int     waveBudget = 100; // [game] wave_budget: «бюджет» волн зомби в процентах (у хоста — для обоих)
 
     // Проверка детерминизма на одном компьютере (только при mode=off)
     enum class Test { Off, Record, Replay } test = Test::Off;
@@ -225,6 +227,10 @@ static void LoadConfig() {
         WritePrivateProfileStringA("net", "delay", "10", path);
         printf("[cfg] created %s\n", path);
     }
+    if (GetPrivateProfileIntA("game", "wave_budget", -1, path) == -1) {
+        WritePrivateProfileStringA("game", "; wave_budget", "100 = normal, 150 = 1.5x more zombie points per wave, 200 = 2x...", path);
+        WritePrivateProfileStringA("game", "wave_budget", "100", path);
+    }
     if (GetPrivateProfileIntA("test", "seed", -1, path) == -1) {
         WritePrivateProfileStringA("test", "; mode", "off | record | replay  (works only with [net] mode=off)", path);
         WritePrivateProfileStringA("test", "mode", "off", path);
@@ -240,6 +246,10 @@ static void LoadConfig() {
     g_cfg.delay = GetPrivateProfileIntA("net", "delay", 10, path);
     if (g_cfg.delay < 2) g_cfg.delay = 2;
     if (g_cfg.delay > 60) g_cfg.delay = 60;
+    g_cfg.waveBudget = GetPrivateProfileIntA("game", "wave_budget", 100, path);
+    if (g_cfg.waveBudget < 50) g_cfg.waveBudget = 50;
+    if (g_cfg.waveBudget > 500) g_cfg.waveBudget = 500;
+    printf("[cfg] wave budget %d%%\n", g_cfg.waveBudget);
 
     if (_stricmp(mode, "host") == 0)        g_cfg.mode = NetMode::Host;
     else if (_stricmp(mode, "client") == 0) g_cfg.mode = NetMode::Client;
@@ -713,6 +723,7 @@ namespace session {
     static std::atomic<bool>     g_haveSeed{ false };  // получен ли seed сессии
     static std::atomic<uint32_t> g_seed{ 0 };
     static std::atomic<int>      g_delay{ 10 };
+    static std::atomic<int>      g_wavePct{ 100 };  // бюджет волн, заданный хостом для этой сессии
     static std::atomic<uint32_t> g_nextLevel{ 0 };    // сколько уровней создано с начала сессии
 
     // Только поток игры:
@@ -904,7 +915,7 @@ __declspec(naked) static void Hook_NextNoAssert() {
 //   HELLO (1): uint32 magic 'PVZC', uint16 protoVersion, uint8 player
 //   TICK  (3): uint32 epoch, uint32 tick, uint8 count, count * Cmd — команды игрока на тик уровня epoch
 //   HASH  (4): uint32 epoch, uint32 tick, uint32 hash              — отпечаток состояния
-//   SEED  (5): uint32 seed, uint32 delay                           — хост -> клиент сразу после HELLO
+//   SEED  (5): uint32 seed, uint32 delay, uint16 wavePct           — хост -> клиент сразу после HELLO
 //   LEVEL (10): uint32 epoch, uint8 event (1 = начал синхронную игру, 2 = ушёл с уровня), uint32 tick
 //
 //   epoch = номер уровня с начала сессии (0, 1, 2...), одинаковый у обоих.
@@ -920,7 +931,7 @@ namespace net {
     };
     enum : uint8_t { LV_START = 1, LV_LEFT = 2 };
     constexpr uint32_t kMagic = 0x435A5650; // 'PVZC'
-    constexpr uint16_t kProto = 6;
+    constexpr uint16_t kProto = 7;
 
     enum : uint8_t { CMD_PLANT = 1, CMD_CLICK = 2 };
     // 10 байт: kind, player, slot, col, row, int16 x, int16 y, int8 clicks
@@ -1001,9 +1012,9 @@ namespace net {
         SendMsg(MSG_LEVEL, p);
     }
 
-    static void SendSeed(uint32_t seed, int delay) {
+    static void SendSeed(uint32_t seed, int delay, int wavePct) {
         std::vector<uint8_t> p;
-        Put<uint32_t>(p, seed); Put<uint32_t>(p, (uint32_t)delay);
+        Put<uint32_t>(p, seed); Put<uint32_t>(p, (uint32_t)delay); Put<uint16_t>(p, (uint16_t)wavePct);
         SendMsg(MSG_SEED, p);
     }
 
@@ -1087,10 +1098,12 @@ namespace net {
             break;
         }
         case MSG_SEED: {
-            uint32_t seed = 0, delay = 10;
-            Get(d, o, seed); Get(d, o, delay);
+            uint32_t seed = 0, delay = 10; uint16_t wavePct = 100;
+            Get(d, o, seed); Get(d, o, delay); Get(d, o, wavePct);
             session::g_seed = seed;
             session::g_delay = (int)delay;
+            session::g_wavePct = wavePct;
+            printf("[net] host settings: zombie wave budget %u%%\n", wavePct);
             session::g_nextLevel = 0;
             session::g_haveSeed = true;
             printf("[net] session seed %08X, delay %u ticks. Now start the SAME level as the host.\n",
@@ -1256,7 +1269,8 @@ namespace net {
                 session::g_delay = g_cfg.delay;
                 session::g_nextLevel = 0;
                 session::g_haveSeed = true;
-                SendSeed(seed, g_cfg.delay);
+                session::g_wavePct = g_cfg.waveBudget;
+                SendSeed(seed, g_cfg.delay, g_cfg.waveBudget);
                 printf("[net] session seed %08X sent. Both players: start the SAME level now.\n", seed);
             }
 
@@ -2691,6 +2705,51 @@ namespace foley {
     }
 }
 
+// ===========================================================================
+// Сложность: «бюджет» волн зомби.
+//
+// Board::PickZombieWaves (0x40C7D0) при создании уровня для каждой волны считает очки
+// (обычно номер_волны / 3 + 1, на флаговой волне ещё ×2,5) и «покупает» на них зомби:
+// обычный стоит 1, конус 2, ведро 4, футболист 7 и т.д. (таблица по 0x723B20, шаг 0x1C).
+// В точке 0x40CC22 очки волны уже посчитаны и лежат в ECX — умножаем их на процент.
+// Больше очков = больше зомби и чаще дорогие. Волны создаются при открытии уровня,
+// поэтому процент должен быть известен обоим ДО этого: его присылает хост при подключении.
+// ===========================================================================
+namespace waves {
+    constexpr uintptr_t Hook_Points = 0x40CC22;   // внутри PickZombieWaves, ECX = очки волны
+    static void* g_orig = nullptr;
+    static DWORD g_lastNote = 0;
+
+    static int CurrentPct() {
+        if (g_netConnected && session::g_haveSeed) return session::g_wavePct;
+        return g_cfg.waveBudget;
+    }
+
+    static uint32_t __stdcall Scale(uint32_t pts) {
+        int pct = CurrentPct();
+        if (pct == 100 || (int)pts <= 0) return pts;
+        uint32_t scaled = (uint32_t)(((uint64_t)pts * (uint32_t)pct + 50) / 100);
+        if (scaled < 1) scaled = 1;
+        DWORD now = GetTickCount();
+        if (now - g_lastNote > 3000) {   // одна строка на уровень, а не на каждую волну
+            g_lastNote = now;
+            printf("[game] zombie wave budget %d%% (first wave: %u -> %u points)\n", pct, pts, scaled);
+        }
+        return scaled;
+    }
+
+    __declspec(naked) static void Hook() {
+        __asm {
+            pushad
+            push ecx
+            call Scale
+            mov[esp + 0x18], eax       // новое значение ECX (место ECX в pushad)
+            popad
+            jmp[g_orig]
+        }
+    }
+}
+
 static bool InstallHooks() {
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK) {
@@ -2706,6 +2765,7 @@ static bool InstallHooks() {
     CreateHook(sc::Fn_MouseDown, (void*)&Hook_ChooserMouseDown, (void**)&g_origChooserMouseDown, "SeedChooser::MouseDown");
     CreateHook(Fn_ChooserOnStart, (void*)&Hook_ChooserOnStart, &g_origChooserOnStart, "SeedChooser::OnStartButton");
     CreateHook(Fn_BoardUpdate, (void*)&Hook_BoardUpdate, (void**)&g_origBoardUpdate, "Board::Update");
+    CreateHook(waves::Hook_Points, (void*)&waves::Hook, &waves::g_orig, "PickZombieWaves (wave budget)");
     CreateHook(foley::Fn_PlayFoleyPitch, (void*)&foley::Hook_Pitch, &foley::g_origPitch, "TodFoley::PlayFoleyPitch");
     CreateHook(foley::Fn_PlayFoley, (void*)&foley::Hook_Play, &foley::g_origPlay, "TodFoley::PlayFoley");
     CreateHook(ui::Fn_SeedBankDraw, (void*)&ui::Hook_SeedBankDraw, &ui::g_origSeedBankDraw, "SeedBank::Draw");

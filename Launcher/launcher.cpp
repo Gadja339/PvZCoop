@@ -1,6 +1,8 @@
 ﻿// PvZ Co-op — лаунчер
 // Окно с настройками сети, кнопка «Играть»: сохраняет coop.ini, запускает игру через Steam,
 // дожидается окна игры и загружает в неё Coop.dll (лежит рядом с лаунчером).
+// Обновления: при запуске проверяет последний Release на GitHub (файл manifest.txt)
+// и по кнопке «Обновить» скачивает изменившиеся файлы, проверяя SHA-256.
 // Сборка: Visual Studio, Release | x86 (Win32), приложение Windows (/SUBSYSTEM:WINDOWS), /MT.
 
 #define WIN32_LEAN_AND_MEAN
@@ -12,32 +14,42 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <winhttp.h>
+#include <bcrypt.h>
 #include <string>
 #include <vector>
 #include <cwchar>
+#include <cwctype>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
     "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
-static const wchar_t* kVersion   = L"1.0";
-static const wchar_t* kGameExe   = L"popcapgame1.exe";        // настоящая игра (Steam GOTY)
-static const wchar_t* kSteamRun  = L"steam://rungameid/3590"; // Plants vs. Zombies GOTY
-static const wchar_t* kDllName   = L"Coop.dll";
+static const wchar_t* kVersion = L"1.0";   // версия этой сборки (если нет version.txt)
+// Репозиторий GitHub с релизами: "ИМЯ_ПОЛЬЗОВАТЕЛЯ/РЕПОЗИТОРИЙ". Можно переопределить в coop.ini:
+//   [update]
+//   repo=user/pvz-coop
+static const wchar_t* kRepo = L"";
+static const wchar_t* kGameExe = L"popcapgame1.exe";        // настоящая игра (Steam GOTY)
+static const wchar_t* kSteamRun = L"steam://rungameid/3590"; // Plants vs. Zombies GOTY
+static const wchar_t* kDllName = L"Coop.dll";
 
 enum {
     ID_HOST = 101, ID_CLIENT, ID_ADDR, ID_PORT, ID_DELAY, ID_HINT, ID_PLAY, ID_LOG, ID_AUTOCLOSE,
-    ID_ADDR_LABEL, ID_DELAY_LABEL
+    ID_ADDR_LABEL, ID_DELAY_LABEL, ID_UPDATE, ID_UPDATE_LABEL, ID_TITLE, ID_WAVES, ID_WAVES_LABEL
 };
-enum { WM_APP_LOG = WM_APP + 1, WM_APP_DONE };
+enum { WM_APP_LOG = WM_APP + 1, WM_APP_DONE, WM_APP_UPDATE_FOUND, WM_APP_UPDATE_DONE };
 
 static HWND  g_wnd = nullptr;
 static HFONT g_font = nullptr, g_fontBig = nullptr;
 static std::wstring g_dir, g_ini, g_dll;
 static volatile bool g_busy = false;
+static std::wstring g_exeName;            // имя файла лаунчера (для самообновления)
 
 // ---------------------------------------------------------------------------
 // Вспомогательное
@@ -90,13 +102,17 @@ static void UpdateHint() {
     EnableWindow(GetDlgItem(g_wnd, ID_ADDR_LABEL), !host);
     EnableWindow(GetDlgItem(g_wnd, ID_DELAY), host);
     EnableWindow(GetDlgItem(g_wnd, ID_DELAY_LABEL), host);
+    EnableWindow(GetDlgItem(g_wnd, ID_WAVES), host);
+    EnableWindow(GetDlgItem(g_wnd, ID_WAVES_LABEL), host);
     std::wstring hint;
     if (host) {
         std::wstring ips = LocalIPv4List();
         hint = L"Ты создаёшь игру. Друг подключается к тебе.\r\n";
         hint += L"Твой адрес в локальной сети: " + (ips.empty() ? std::wstring(L"не найден") : ips) + L"\r\n";
-        hint += L"Через Porthole: раздай TCP-порт " + GetText(ID_PORT) + L".";
-    } else {
+        hint += L"Через Porthole: раздай TCP-порт " + GetText(ID_PORT) + L".\r\n";
+        hint += L"Сложность волн выбирает хост — у друга будет так же.";
+    }
+    else {
         hint = L"Ты подключаешься к другу.\r\n";
         hint += L"Локальная сеть: адрес хоста (192.168.x.x), порт как у хоста.\r\n";
         hint += L"Через Porthole: 127.0.0.1 и порт, который показывает Porthole.";
@@ -112,7 +128,7 @@ static void LoadSettings() {
     wchar_t mode[32] = {}, host[128] = {};
     GetPrivateProfileStringW(L"net", L"mode", L"host", mode, 32, g_ini.c_str());
     GetPrivateProfileStringW(L"net", L"host", L"127.0.0.1", host, 128, g_ini.c_str());
-    int port  = GetPrivateProfileIntW(L"net", L"port", 34567, g_ini.c_str());
+    int port = GetPrivateProfileIntW(L"net", L"port", 34567, g_ini.c_str());
     int delay = GetPrivateProfileIntW(L"net", L"delay", 10, g_ini.c_str());
 
     bool client = _wcsicmp(mode, L"client") == 0;
@@ -121,6 +137,15 @@ static void LoadSettings() {
     SetDlgItemInt(g_wnd, ID_PORT, port, FALSE);
     int sel = delay <= 10 ? 0 : delay <= 15 ? 1 : delay <= 20 ? 2 : 3;
     SendDlgItemMessageW(g_wnd, ID_DELAY, CB_SETCURSEL, sel, 0);
+    int waves = GetPrivateProfileIntW(L"game", L"wave_budget", 100, g_ini.c_str());
+    int wsel = waves < 125 ? 0 : waves < 175 ? 1 : waves < 250 ? 2 : 3;
+    SendDlgItemMessageW(g_wnd, ID_WAVES, CB_SETCURSEL, wsel, 0);
+}
+
+static int WavesFromCombo() {
+    static const int values[] = { 100, 150, 200, 300 };
+    LRESULT i = SendDlgItemMessageW(g_wnd, ID_WAVES, CB_GETCURSEL, 0, 0);
+    return (i >= 0 && i < 4) ? values[i] : 100;
 }
 
 static int DelayFromCombo() {
@@ -147,6 +172,8 @@ static bool SaveSettings() {
     if (!addr.empty()) WritePrivateProfileStringW(L"net", L"host", addr.c_str(), ini);
     WritePrivateProfileStringW(L"net", L"port", std::to_wstring(port).c_str(), ini);
     WritePrivateProfileStringW(L"net", L"delay", std::to_wstring(DelayFromCombo()).c_str(), ini);
+    if (IsHost())
+        WritePrivateProfileStringW(L"game", L"wave_budget", std::to_wstring(WavesFromCombo()).c_str(), ini);
     return true;
 }
 
@@ -193,7 +220,7 @@ static bool HasVisibleWindow(DWORD pid) {
 // 0 = успех, иначе текст ошибки
 static const wchar_t* Inject(DWORD pid, const std::wstring& dll) {
     HANDLE proc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-                              PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+        PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
     if (!proc) return L"нет доступа к процессу игры. Запусти лаунчер от имени администратора.";
     size_t bytes = (dll.size() + 1) * sizeof(wchar_t);
     void* remote = VirtualAllocEx(proc, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -237,7 +264,8 @@ static DWORD WINAPI PlayThread(LPVOID) {
             PostMessageW(g_wnd, WM_APP_DONE, 0, 0);
             return 0;
         }
-    } else {
+    }
+    else {
         Log(L"Игра уже запущена.");
     }
     // Ждём окно игры: к этому моменту игра успевает подготовиться
@@ -256,24 +284,300 @@ static DWORD WINAPI PlayThread(LPVOID) {
     }
     Log(L"Готово! Мод загружен — рядом с игрой откроется окно мода.");
     Log(IsHost() ? L"Жди, пока друг подключится, потом оба открывайте один и тот же уровень."
-                 : L"Когда в окне мода появится «session seed», открывай тот же уровень, что и хост.");
+        : L"Когда в окне мода появится «session seed», открывай тот же уровень, что и хост.");
     PostMessageW(g_wnd, WM_APP_DONE, 1, 0);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Обновление через GitHub Releases
+//
+// В последнем релизе репозитория должен лежать manifest.txt:
+//   version=1.1
+//   tag=v1.1
+//   Coop.dll <sha256>
+//   PvZCoopLauncher.exe <sha256>
+//   coop_seedbank.png <sha256>
+// Лаунчер скачивает https://github.com/<repo>/releases/latest/download/manifest.txt,
+// сравнивает version со своей (version.txt рядом с лаунчером) и по кнопке скачивает
+// изменившиеся файлы из https://github.com/<repo>/releases/download/<tag>/<файл>.
+// ---------------------------------------------------------------------------
+
+struct ManifestFile { std::wstring name, sha; };
+struct Manifest { std::wstring version, tag; std::vector<ManifestFile> files; };
+static Manifest g_manifest;      // найденное обновление (заполняет поток проверки)
+
+static std::wstring Widen(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::wstring RepoName() {
+    wchar_t repo[200] = {};
+    GetPrivateProfileStringW(L"update", L"repo", kRepo, repo, 200, g_ini.c_str());
+    return repo;
+}
+
+static std::wstring LocalVersion() {
+    FILE* f = nullptr;
+    std::wstring v = kVersion;
+    if (_wfopen_s(&f, (g_dir + L"version.txt").c_str(), L"rb") == 0 && f) {
+        char buf[64] = {};
+        fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        std::wstring w = Widen(buf);
+        size_t e = w.find_first_of(L"\r\n \t");
+        if (e != std::wstring::npos) w.resize(e);
+        if (!w.empty()) v = w;
+    }
+    return v;
+}
+
+// «1.10» > «1.9»: сравниваем числа через точку
+static int CompareVersions(const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        long x = 0, y = 0;
+        while (i < a.size() && iswdigit(a[i])) x = x * 10 + (a[i++] - L'0');
+        while (j < b.size() && iswdigit(b[j])) y = y * 10 + (b[j++] - L'0');
+        if (x != y) return x < y ? -1 : 1;
+        while (i < a.size() && !iswdigit(a[i])) ++i;
+        while (j < b.size() && !iswdigit(b[j])) ++j;
+    }
+    return 0;
+}
+
+// HTTPS GET (переходы по redirect включены). maxBytes — защита от слишком больших ответов.
+static bool HttpGet(const std::wstring& url, std::string& out, size_t maxBytes, std::wstring& err) {
+    out.clear();
+    URL_COMPONENTS uc{ sizeof(uc) };
+    wchar_t host[256] = {}, path[2048] = {};
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 2048;
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS) {
+        err = L"неверная ссылка"; return false;
+    }
+    HINTERNET ses = WinHttpOpen(L"PvZCoopLauncher", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) ses = WinHttpOpen(L"PvZCoopLauncher", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) { err = L"нет доступа к сети"; return false; }
+    WinHttpSetTimeouts(ses, 8000, 8000, 15000, 30000);
+    HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
+    HINTERNET req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    bool ok = false;
+    if (req && WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status == 200) {
+            ok = true;
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(req, &avail)) { ok = false; err = L"обрыв загрузки"; break; }
+                if (!avail) break;
+                if (out.size() + avail > maxBytes) { ok = false; err = L"файл слишком большой"; break; }
+                size_t old = out.size();
+                out.resize(old + avail);
+                DWORD got = 0;
+                if (!WinHttpReadData(req, &out[old], avail, &got)) { ok = false; err = L"обрыв загрузки"; break; }
+                out.resize(old + got);
+            }
+        }
+        else {
+            err = status == 404 ? L"не найдено (нет релиза или manifest.txt?)" : L"ошибка сервера " + std::to_wstring(status);
+        }
+    }
+    else if (err.empty()) {
+        err = L"нет соединения с GitHub";
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+    return ok;
+}
+
+static std::wstring Sha256Hex(const void* data, size_t len) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    unsigned char digest[32] = {};
+    std::wstring hex;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return hex;
+    if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
+        BCryptHashData(h, (PUCHAR)data, (ULONG)len, 0);
+        BCryptFinishHash(h, digest, 32, 0);
+        BCryptDestroyHash(h);
+        wchar_t b[3];
+        for (unsigned char c : digest) { swprintf_s(b, L"%02x", c); hex += b; }
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return hex;
+}
+
+static bool ReadWholeFile(const std::wstring& path, std::string& out) {
+    out.clear();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    fclose(f);
+    return true;
+}
+
+static bool WriteWholeFile(const std::wstring& path, const std::string& data) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    return ok;
+}
+
+// Обновлять разрешено только эти файлы (защита от «вредного» manifest.txt)
+static bool AllowedFile(const std::wstring& n) {
+    static const wchar_t* allowed[] = { L"Coop.dll", L"PvZCoopLauncher.exe", L"coop_seedbank.png" };
+    for (const wchar_t* a : allowed) if (_wcsicmp(n.c_str(), a) == 0) return true;
+    return false;
+}
+
+static bool ParseManifest(const std::string& text, Manifest& m) {
+    m = Manifest();
+    std::wstring t = Widen(text);
+    size_t pos = 0;
+    while (pos < t.size()) {
+        size_t e = t.find(L'\n', pos);
+        std::wstring line = t.substr(pos, e == std::wstring::npos ? std::wstring::npos : e - pos);
+        pos = e == std::wstring::npos ? t.size() : e + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t')) line.pop_back();
+        if (line.empty() || line[0] == L'#') continue;
+        if (line.rfind(L"version=", 0) == 0) { m.version = line.substr(8); continue; }
+        if (line.rfind(L"tag=", 0) == 0) { m.tag = line.substr(4); continue; }
+        size_t sp = line.find_first_of(L" \t");
+        if (sp == std::wstring::npos) continue;
+        ManifestFile f;
+        f.name = line.substr(0, sp);
+        f.sha = line.substr(line.find_first_not_of(L" \t", sp));
+        for (auto& c : f.sha) c = towlower(c);
+        if (AllowedFile(f.name) && f.sha.size() == 64) m.files.push_back(f);
+    }
+    return !m.version.empty() && !m.tag.empty() && !m.files.empty();
+}
+
+static DWORD WINAPI CheckUpdateThread(LPVOID) {
+    std::wstring repo = RepoName();
+    if (repo.empty() || repo.find(L'/') == std::wstring::npos) return 0;   // обновления не настроены
+    std::string text;
+    std::wstring err;
+    if (!HttpGet(L"https://github.com/" + repo + L"/releases/latest/download/manifest.txt", text, 64 * 1024, err)) {
+        Log(L"Проверка обновлений: " + err);
+        return 0;
+    }
+    Manifest m;
+    if (!ParseManifest(text, m)) { Log(L"Проверка обновлений: manifest.txt в релизе повреждён"); return 0; }
+    std::wstring mine = LocalVersion();
+    if (CompareVersions(m.version, mine) > 0) {
+        g_manifest = m;
+        PostMessageW(g_wnd, WM_APP_UPDATE_FOUND, 0, 0);
+    }
+    else {
+        Log(L"У тебя последняя версия (" + mine + L").");
+    }
+    return 0;
+}
+
+static DWORD WINAPI UpdateThread(LPVOID) {
+    const Manifest m = g_manifest;
+    const std::wstring repo = RepoName();
+    DWORD pid = FindProcess(kGameExe);
+    if (pid && HasModule(pid, kDllName)) {
+        Log(L"Сначала закрой игру: Coop.dll сейчас используется.");
+        PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+        return 0;
+    }
+    Log(L"Обновляю до версии " + m.version + L"...");
+    bool selfUpdated = false;
+    int changed = 0;
+    for (const auto& f : m.files) {
+        std::wstring target = g_dir + f.name;
+        std::string cur;
+        if (ReadWholeFile(target, cur) && Sha256Hex(cur.data(), cur.size()) == f.sha) continue; // уже такой
+        std::string data;
+        std::wstring err;
+        Log(L"  скачиваю " + f.name + L"...");
+        if (!HttpGet(L"https://github.com/" + repo + L"/releases/download/" + m.tag + L"/" + f.name,
+            data, 64u * 1024 * 1024, err)) {
+            Log(L"  ошибка: " + err + L". Обновление прервано.");
+            PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+            return 0;
+        }
+        if (Sha256Hex(data.data(), data.size()) != f.sha) {
+            Log(L"  " + f.name + L": контрольная сумма не совпала — файл не тот. Обновление прервано.");
+            PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+            return 0;
+        }
+        std::wstring tmp = target + L".new";
+        if (!WriteWholeFile(tmp, data)) {
+            Log(L"  не удалось записать " + f.name + L" (папка только для чтения?)");
+            PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+            return 0;
+        }
+        bool isSelf = _wcsicmp(f.name.c_str(), g_exeName.c_str()) == 0;
+        if (isSelf) {
+            // Запущенный exe нельзя перезаписать, но можно переименовать
+            std::wstring old = target + L".old";
+            DeleteFileW(old.c_str());
+            if (!MoveFileW(target.c_str(), old.c_str())) {
+                Log(L"  не удалось заменить лаунчер"); DeleteFileW(tmp.c_str());
+                PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+                return 0;
+            }
+            selfUpdated = true;
+        }
+        if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            Log(L"  не удалось заменить " + f.name + L" (файл занят?)");
+            PostMessageW(g_wnd, WM_APP_UPDATE_DONE, 0, 0);
+            return 0;
+        }
+        ++changed;
+    }
+    {
+        std::string v;
+        for (wchar_t c : m.version) v += (char)c;
+        WriteWholeFile(g_dir + L"version.txt", v);
+    }
+    Log(L"Готово: обновлено файлов — " + std::to_wstring(changed) + L", версия " + m.version + L".");
+    PostMessageW(g_wnd, WM_APP_UPDATE_DONE, selfUpdated ? 2 : 1, 0);
+    return 0;
+}
+
+static void OnUpdate() {
+    if (g_busy) return;
+    g_busy = true;
+    EnableWindow(GetDlgItem(g_wnd, ID_UPDATE), FALSE);
+    EnableWindow(GetDlgItem(g_wnd, ID_PLAY), FALSE);
+    HANDLE t = CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
 }
 
 static void OnPlay() {
     if (g_busy) return;
     if (GetFileAttributesW(g_dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxW(g_wnd, (L"Не найден " + std::wstring(kDllName) + L" рядом с лаунчером:\n" + g_dll).c_str(),
-                    L"PvZ Co-op", MB_ICONERROR);
+            L"PvZ Co-op", MB_ICONERROR);
         return;
     }
     if (!SaveSettings()) return;
     g_busy = true;
     EnableWindow(GetDlgItem(g_wnd, ID_PLAY), FALSE);
     SetDlgItemTextW(g_wnd, ID_LOG, L"");
-    Log(IsHost() ? L"Режим: хост, порт " + GetText(ID_PORT) + L", задержка " + std::to_wstring(DelayFromCombo())
-                 : L"Режим: подключение к " + GetText(ID_ADDR) + L":" + GetText(ID_PORT));
+    Log(IsHost() ? L"Режим: хост, порт " + GetText(ID_PORT) + L", задержка " + std::to_wstring(DelayFromCombo()) +
+        L", зомби " + std::to_wstring(WavesFromCombo()) + L"%"
+        : L"Режим: подключение к " + GetText(ID_ADDR) + L":" + GetText(ID_PORT));
     HANDLE t = CreateThread(nullptr, 0, PlayThread, nullptr, 0, nullptr);
     if (t) CloseHandle(t);
 }
@@ -283,16 +587,19 @@ static void OnPlay() {
 // ---------------------------------------------------------------------------
 
 static HWND Add(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id,
-                DWORD exStyle = 0, HFONT font = nullptr) {
+    DWORD exStyle = 0, HFONT font = nullptr) {
     HWND c = CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_wnd,
-                             (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+        (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)(font ? font : g_font), TRUE);
     return c;
 }
 
 static void CreateControls() {
-    std::wstring title = L"PvZ Co-op  v" + std::wstring(kVersion);
-    Add(L"STATIC", title.c_str(), 0, 16, 12, 400, 28, 0, 0, g_fontBig);
+    std::wstring title = L"PvZ Co-op  v" + LocalVersion();
+    Add(L"STATIC", title.c_str(), 0, 16, 12, 230, 28, ID_TITLE, 0, g_fontBig);
+    Add(L"STATIC", L"", SS_RIGHT, 240, 8, 120, 34, ID_UPDATE_LABEL);
+    HWND ub = Add(L"BUTTON", L"Обновить", WS_TABSTOP, 365, 12, 80, 26, ID_UPDATE);
+    ShowWindow(ub, SW_HIDE);
 
     Add(L"BUTTON", L"Я хост (создаю игру)", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 16, 50, 200, 22, ID_HOST);
     Add(L"BUTTON", L"Подключаюсь к другу", BS_AUTORADIOBUTTON, 230, 50, 200, 22, ID_CLIENT);
@@ -309,13 +616,20 @@ static void CreateControls() {
     SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"20 ходов — интернет / Porthole");
     SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"30 ходов — плохая связь");
 
-    Add(L"STATIC", L"", 0, 16, 156, 430, 60, ID_HINT);
+    Add(L"STATIC", L"Зомби в волнах:", 0, 16, 156, 120, 20, ID_WAVES_LABEL);
+    HWND wb = Add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 140, 153, 305, 200, ID_WAVES);
+    SendMessageW(wb, CB_ADDSTRING, 0, (LPARAM)L"как в обычной игре");
+    SendMessageW(wb, CB_ADDSTRING, 0, (LPARAM)L"×1,5 — сложнее");
+    SendMessageW(wb, CB_ADDSTRING, 0, (LPARAM)L"×2 — тяжело");
+    SendMessageW(wb, CB_ADDSTRING, 0, (LPARAM)L"×3 — кошмар");
 
-    Add(L"BUTTON", L"Играть", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 224, 160, 40, ID_PLAY, 0, g_fontBig);
-    HWND ac = Add(L"BUTTON", L"Закрыть лаунчер после запуска", BS_AUTOCHECKBOX | WS_TABSTOP, 196, 233, 250, 22, ID_AUTOCLOSE);
+    Add(L"STATIC", L"", 0, 16, 190, 430, 60, ID_HINT);
+
+    Add(L"BUTTON", L"Играть", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 258, 160, 40, ID_PLAY, 0, g_fontBig);
+    HWND ac = Add(L"BUTTON", L"Закрыть лаунчер после запуска", BS_AUTOCHECKBOX | WS_TABSTOP, 196, 267, 250, 22, ID_AUTOCLOSE);
     SendMessageW(ac, BM_SETCHECK, BST_CHECKED, 0);
 
-    Add(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 16, 276, 430, 130, ID_LOG,
+    Add(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 16, 310, 430, 130, ID_LOG,
         WS_EX_CLIENTEDGE);
 }
 
@@ -333,6 +647,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         CreateControls();
         LoadSettings();
         UpdateHint();
+        if (HANDLE t = CreateThread(nullptr, 0, CheckUpdateThread, nullptr, 0, nullptr)) CloseHandle(t);
         return 0;
     }
     case WM_COMMAND:
@@ -340,6 +655,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_HOST: case ID_CLIENT: UpdateHint(); break;
         case ID_PORT: if (HIWORD(wp) == EN_CHANGE && IsHost()) UpdateHint(); break;
         case ID_PLAY: case IDOK: OnPlay(); break;
+        case ID_UPDATE: OnUpdate(); break;
         }
         return 0;
     case WM_APP_LOG: {
@@ -352,6 +668,32 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         delete s;
         return 0;
     }
+    case WM_APP_UPDATE_FOUND: {
+        std::wstring t = L"Есть версия " + g_manifest.version;
+        SetDlgItemTextW(h, ID_UPDATE_LABEL, t.c_str());
+        ShowWindow(GetDlgItem(h, ID_UPDATE), SW_SHOW);
+        Log(L"Доступна новая версия " + g_manifest.version + L" (у тебя " + LocalVersion() +
+            L"). Нажми «Обновить» вверху.");
+        return 0;
+    }
+    case WM_APP_UPDATE_DONE:
+        g_busy = false;
+        EnableWindow(GetDlgItem(h, ID_PLAY), TRUE);
+        if (wp == 0) { EnableWindow(GetDlgItem(h, ID_UPDATE), TRUE); return 0; }
+        ShowWindow(GetDlgItem(h, ID_UPDATE), SW_HIDE);
+        SetDlgItemTextW(h, ID_UPDATE_LABEL, L"");
+        if (wp == 2) {
+            // Лаунчер заменён — запускаем новый и закрываемся
+            MessageBoxW(h, L"Лаунчер обновлён и сейчас перезапустится.", L"PvZ Co-op", MB_ICONINFORMATION);
+            std::wstring exe = g_dir + g_exeName;
+            ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, g_dir.c_str(), SW_SHOWNORMAL);
+            DestroyWindow(h);
+        }
+        else {
+            std::wstring title = L"PvZ Co-op  v" + LocalVersion();
+            SetDlgItemTextW(h, ID_TITLE, title.c_str());
+        }
+        return 0;
     case WM_APP_DONE:
         g_busy = false;
         EnableWindow(GetDlgItem(h, ID_PLAY), TRUE);
@@ -370,7 +712,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CLOSE:
         if (g_busy && MessageBoxW(h, L"Лаунчер ещё ждёт игру. Закрыть?", L"PvZ Co-op",
-                                  MB_YESNO | MB_ICONQUESTION) != IDYES)
+            MB_YESNO | MB_ICONQUESTION) != IDYES)
             return 0;
         DestroyWindow(h);
         return 0;
@@ -392,6 +734,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_dir = exe;
     g_dir = g_dir.substr(0, g_dir.find_last_of(L"\\/") + 1);
     g_ini = g_dir + L"coop.ini";
+    g_exeName = std::wstring(exe).substr(g_dir.size());
+    DeleteFileW((g_dir + g_exeName + L".old").c_str());   // остаток прошлого самообновления
     g_dll = g_dir + kDllName;
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -403,11 +747,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
-    RECT r{ 0, 0, 462, 422 };
+    RECT r{ 0, 0, 462, 456 };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     HWND w = CreateWindowExW(0, wc.lpszClassName, L"PvZ Co-op", style, CW_USEDEFAULT, CW_USEDEFAULT,
-                             r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
+        r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     ShowWindow(w, show);
     UpdateWindow(w);
 
