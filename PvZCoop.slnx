@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Coop/Coop.vcxproj" Id="e526a493-76f2-4c00-b0fb-f00c0b344628" />
+  <Project Path="injector/injector.vcxproj" Id="fa390a90-0a2c-49b6-9522-996f6ca4e23f" />
+  <Project Path="Launcher/Launcher.vcxproj" Id="3b6f2c1e-8d4a-4f7b-9c2e-5a1d7e0b9f42">
+    <Platform Project="Win32" />
+  </Project>
+</Solution>

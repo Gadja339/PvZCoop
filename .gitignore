@@ -1,0 +1,11 @@
+.vs/
+[Rr]elease/
+[Dd]ebug/
+x64/
+*.user
+tools/main_unpacked/
+release_upload/
+*.bin
+coop_log*.txt
+coop_rng_trace*.txt
+coop_replay.txt
